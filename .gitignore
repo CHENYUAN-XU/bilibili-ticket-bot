@@ -1,0 +1,31 @@
+# Python venv
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+*.exe
+
+# Personal data
+cookies.json
+ticket_bot.log
+screenshots/
+
+# Video analysis temp
+video/
+debug/
+dist.zip
+run.bat
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

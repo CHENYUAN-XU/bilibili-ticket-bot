@@ -1,0 +1,4 @@
+playwright>=1.40
+pyyaml>=6.0
+loguru>=0.7.0
+pyinstaller>=6.0
