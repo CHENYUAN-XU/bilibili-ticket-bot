@@ -7,6 +7,9 @@ ticket_url: ""
 # 开售时间，格式：YYYY-MM-DD HH:MM:SS（必须填写）
 sale_time: ""
 
+# 开售时间所属时区；默认使用中国标准时间，避免电脑切换时区后倒计时偏移
+sale_timezone: "Asia/Shanghai"
+
 # 开售时间偏移量（秒），用于校准本地/服务器时间
 # 正数 = 延迟开始（适合本地时间比服务器快）
 # 负数 = 提前开始（适合本地时间比服务器慢）
@@ -47,3 +50,7 @@ max_retry: 30
 # 实际间隔会在此基础上有少量随机抖动，并伴随小幅滚动，降低风控概率
 # 若频繁出现验证码，可适当调大
 action_delay: 0.5
+
+# 测试完成、进入支付页或自动流程失败时保留浏览器，按回车后才关闭
+keep_browser_open: true
+keep_browser_open_on_failure: true
