@@ -3,9 +3,10 @@ import json
 import random
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from loguru import logger
@@ -33,6 +34,19 @@ MOBILE_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 )
 
+DEFAULT_SALE_TIMEZONE = "Asia/Shanghai"
+PURCHASE_BUTTON_TEXTS = (
+    "立即预订", "立即购买", "立即购票", "立即下单", "立即抢购", "马上购票",
+)
+PURCHASE_BUTTON_SELECTORS = [
+    ".pre-sale-button", ".footer-container .bili-button", ".detail-floating-btn .bili-button",
+    ".bottom-bar .bili-button", ".footer-menu-wrapper .bili-button", "footer .bili-button",
+    ".fixed-bottom .bili-button", ".submit-bar .bili-button",
+    "[data-testid*='buy']", "[data-testid*='purchase']", "[class*='bottom'] [class*='button']",
+    "[class*='bottom'][class*='button']", "[class*='footer'] [class*='button']",
+    "[class*='footer'][class*='button']", "[class*='buy-button']", "[class*='purchase-button']",
+]
+
 
 def setup_logger():
     logger.remove()
@@ -40,6 +54,31 @@ def setup_logger():
     logger.add(sys.stdout, level="INFO", colorize=True)
     # 文件日志
     logger.add(BASE_DIR / "ticket_bot.log", level="DEBUG", encoding="utf-8", rotation="10 MB")
+
+
+def browser_launch_error_message(error: Exception) -> str:
+    """Return an actionable error for a missing/broken Playwright browser runtime."""
+    return (
+        "浏览器启动失败。请确认 Chrome 或 Edge 可以正常打开；若只安装了源码依赖，"
+        "请在项目目录运行 `python -m playwright install chromium` 后重试。"
+        f" 原始错误: {error}"
+    )
+
+
+async def launch_ticket_browser(playwright, launch_kwargs: dict):
+    """Launch a browser without letting a missing runtime close the program silently."""
+    try:
+        return await playwright.chromium.launch(**launch_kwargs)
+    except Exception as error:
+        logger.error(browser_launch_error_message(error))
+        return None
+
+
+def resolve_sale_timezone(timezone_name: str):
+    """Windows 未安装 tzdata 时仍可靠地支持会员购使用的中国标准时间。"""
+    if timezone_name in ("Asia/Shanghai", "Asia/Chongqing", "Asia/Harbin", "PRC"):
+        return timezone(timedelta(hours=8), name="Asia/Shanghai")
+    return ZoneInfo(timezone_name)
 
 
 def load_config():
@@ -84,6 +123,22 @@ def ensure_config(config: dict) -> dict:
     if not config.get("target_date"):
         config["target_date"] = prompt_input("请输入目标日期", "2026-07-10")
         changed = True
+
+    timezone_name = config.get("sale_timezone", DEFAULT_SALE_TIMEZONE)
+    try:
+        resolve_sale_timezone(timezone_name)
+    except (ZoneInfoNotFoundError, TypeError):
+        logger.warning(f"无效的开售时区 {timezone_name}，已改为 {DEFAULT_SALE_TIMEZONE}")
+        timezone_name = DEFAULT_SALE_TIMEZONE
+        changed = True
+    if config.get("sale_timezone") != timezone_name:
+        config["sale_timezone"] = timezone_name
+        changed = True
+
+    for key in ("keep_browser_open", "keep_browser_open_on_failure"):
+        if key not in config:
+            config[key] = True
+            changed = True
 
     try:
         config["ticket_count"] = int(config.get("ticket_count", 1))
@@ -240,8 +295,8 @@ async def save_cookies(context):
 _server_time_offset = 0.0
 
 
-def _fetch_bilibili_server_time() -> Optional[float]:
-    """通过 HTTP 请求获取 B站服务器时间戳（秒）"""
+def _fetch_bilibili_server_time() -> Optional[tuple[float, float, float]]:
+    """返回服务器时间及请求起止时间，用请求中点降低网络延迟造成的误差。"""
     import urllib.request
     urls = [
         "https://www.bilibili.com",
@@ -250,17 +305,19 @@ def _fetch_bilibili_server_time() -> Optional[float]:
     ]
     for url in urls:
         try:
+            request_started = time.time()
             req = urllib.request.Request(url, method="HEAD", headers={
                 "User-Agent": MOBILE_USER_AGENT,
                 "Accept": "*/*",
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-store",
             })
             with urllib.request.urlopen(req, timeout=5) as resp:
+                request_finished = time.time()
                 date_header = resp.headers.get("Date")
                 if date_header:
                     from email.utils import parsedate_to_datetime
                     dt = parsedate_to_datetime(date_header)
-                    return dt.timestamp()
+                    return dt.timestamp(), request_started, request_finished
         except Exception as e:
             logger.debug(f"从 {url} 获取服务器时间失败: {e}")
             continue
@@ -268,17 +325,29 @@ def _fetch_bilibili_server_time() -> Optional[float]:
 
 
 async def sync_server_time(page: Page) -> float:
-    """同步 B站服务器时间，返回本地时间与服务器时间的偏移量（秒）"""
+    """多次同步 B站服务器时间，取中位数降低网络抖动影响。"""
     global _server_time_offset
     try:
-        server_timestamp = await asyncio.get_event_loop().run_in_executor(None, _fetch_bilibili_server_time)
-        if server_timestamp is None:
+        samples = []
+        for _ in range(3):
+            sample = await asyncio.get_event_loop().run_in_executor(
+                None, _fetch_bilibili_server_time
+            )
+            if sample:
+                server_timestamp, request_started, request_finished = sample
+                midpoint = (request_started + request_finished) / 2
+                samples.append(server_timestamp - midpoint)
+            await asyncio.sleep(0.05)
+        if not samples:
             logger.warning("同步服务器时间失败: 无法从 B站获取时间")
             return _server_time_offset
 
-        local_timestamp = time.time()
-        _server_time_offset = server_timestamp - local_timestamp
-        logger.info(f"服务器时间同步完成，本地时间偏移: {_server_time_offset:.3f} 秒")
+        samples.sort()
+        _server_time_offset = samples[len(samples) // 2]
+        logger.info(
+            f"服务器时间同步完成，本地时间偏移: {_server_time_offset:.3f} 秒"
+            f"（{len(samples)} 次取样）"
+        )
     except Exception as e:
         logger.warning(f"同步服务器时间异常: {e}")
     return _server_time_offset
@@ -287,6 +356,21 @@ async def sync_server_time(page: Page) -> float:
 def get_synced_now() -> datetime:
     """获取同步后的当前时间"""
     return datetime.fromtimestamp(time.time() + _server_time_offset)
+
+
+def get_synced_timestamp() -> float:
+    return time.time() + _server_time_offset
+
+
+def parse_sale_time(value: str, timezone_name: str) -> datetime:
+    """把配置中的开售时间明确解释为指定时区，避免电脑系统时区造成误抢。"""
+    local_dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    return local_dt.replace(tzinfo=resolve_sale_timezone(timezone_name))
+
+
+def sale_time_is_stale(sale_time: datetime, server_timestamp: float, grace_seconds: float = 60) -> bool:
+    """Guard against a forgotten historical sale_time in non-test mode."""
+    return sale_time.timestamp() < server_timestamp - grace_seconds
 
 
 async def wait_for_element_by_text(
@@ -367,23 +451,60 @@ async def click_by_text(
     return False
 
 
-async def wait_for_sale_start(target_dt: datetime, before_seconds: int = 60, sale_time_offset: float = 0.0):
+def is_purchase_button_text(text: str) -> bool:
+    normalized = "".join(text.split())
+    return any(candidate in normalized for candidate in PURCHASE_BUTTON_TEXTS)
+
+
+async def log_visible_actions(page: Page, reason: str):
+    """页面改版时输出无敏感信息的可点击控件摘要，方便快速更新定位器。"""
+    selector = "button, [role='button'], .bili-button, [class*='button'], [class*='btn']"
+    try:
+        elements = await page.query_selector_all(selector)
+        actions = []
+        for el in elements:
+            if not await el.is_visible():
+                continue
+            text = " ".join((await el.inner_text()).split())[:80]
+            if not text:
+                continue
+            cls = str(await el.evaluate("e => e.className || ''"))[:100]
+            actions.append(f"{text} [{cls}]")
+            if len(actions) >= 15:
+                break
+        logger.warning(f"页面诊断（{reason}）: {actions or '未找到可见操作控件'}")
+    except Exception as e:
+        logger.debug(f"页面诊断失败: {e}")
+
+
+async def wait_for_sale_start(
+    target_dt: datetime,
+    before_seconds: int = 60,
+    sale_time_offset: float = 0.0,
+    resync_callback=None,
+):
     """等待开售（使用同步后的服务器时间）"""
     # 应用用户配置的时间偏移
     effective_target_dt = target_dt.timestamp() + sale_time_offset
 
-    now = get_synced_now()
+    now_timestamp = get_synced_timestamp()
     start_wait = effective_target_dt - before_seconds
-    if now.timestamp() < start_wait:
-        sleep_sec = start_wait - now.timestamp()
-        logger.info(f"离开售还有 {sleep_sec:.1f} 秒（已同步服务器时间），提前 {before_seconds} 秒再启动高频刷新")
-        await asyncio.sleep(sleep_sec)
+    if now_timestamp < start_wait:
+        logger.info(
+            f"离开售还有 {start_wait - now_timestamp:.1f} 秒（已同步服务器时间），"
+            f"提前 {before_seconds} 秒再启动高频刷新"
+        )
+        # 长时间等待时分段休眠并重新同步；最后一分钟不再改动时钟偏移。
+        while get_synced_timestamp() < start_wait:
+            sleep_sec = min(60.0, start_wait - get_synced_timestamp())
+            await asyncio.sleep(sleep_sec)
+            if resync_callback and get_synced_timestamp() < start_wait:
+                await resync_callback()
 
     logger.info("进入高频刷新阶段")
     last_log = -1
     while True:
-        now = get_synced_now()
-        diff = effective_target_dt - now.timestamp()
+        diff = effective_target_dt - get_synced_timestamp()
         if diff <= 0:
             logger.info("已到达开售时间！")
             return
@@ -398,11 +519,16 @@ async def wait_for_modal(page: Page, timeout: float = 3.0) -> bool:
     """等待购票弹窗出现"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        modal = await page.query_selector(
-            ".ticket-modal-container, .selection-modal.ticket-modal"
+        modals = await page.query_selector_all(
+            ".ticket-modal-container, .selection-modal.ticket-modal, "
+            ".bili-modal.selection-modal, [role='dialog']"
         )
-        if modal and await modal.is_visible():
-            return True
+        for modal in modals:
+            if not await modal.is_visible():
+                continue
+            text = await modal.inner_text()
+            if any(keyword in text for keyword in ("场次", "票价", "票档", "购票", "预售")):
+                return True
         await asyncio.sleep(0.1)
     return False
 
@@ -416,22 +542,11 @@ async def wait_for_bottom_button_ready(page: Page, timeout: float = 30.0) -> boo
             if await detect_captcha(page):
                 await handle_captcha(page)
 
-            # 先找明确的'立即预订'按钮
-            selectors = [
-                ".pre-sale-button",
-                ".footer-container .bili-button",
-                ".detail-floating-btn .bili-button",
-                ".bottom-bar .bili-button",
-                ".footer-menu-wrapper .bili-button",
-                "footer .bili-button",
-                ".fixed-bottom .bili-button",
-                ".submit-bar .bili-button",
-            ]
-            for sel in selectors:
+            for sel in PURCHASE_BUTTON_SELECTORS:
                 btns = await page.query_selector_all(sel)
                 for b in btns:
                     text = (await b.inner_text()).strip()
-                    if "立即预订" in text or "立即购买" in text or "立即购票" in text:
+                    if is_purchase_button_text(text) and not await element_is_disabled(b):
                         logger.info(f"底部按钮已就绪: {text}")
                         return True
                     if "即将开售" in text:
@@ -440,6 +555,7 @@ async def wait_for_bottom_button_ready(page: Page, timeout: float = 30.0) -> boo
             logger.debug(f"等待按钮过程出错: {e}")
         await asyncio.sleep(0.1)
     logger.warning("等待底部按钮就绪超时")
+    await log_visible_actions(page, "未识别到开售按钮")
     return False
 
 
@@ -451,21 +567,11 @@ async def click_bottom_button(page: Page) -> bool:
             if await detect_captcha(page):
                 await handle_captcha(page)
 
-            selectors = [
-                ".pre-sale-button",
-                ".footer-container .bili-button",
-                ".detail-floating-btn .bili-button",
-                ".bottom-bar .bili-button",
-                ".footer-menu-wrapper .bili-button",
-                "footer .bili-button",
-                ".fixed-bottom .bili-button",
-                ".submit-bar .bili-button",
-            ]
-            for sel in selectors:
+            for sel in PURCHASE_BUTTON_SELECTORS:
                 btns = await page.query_selector_all(sel)
                 for b in btns:
                     text = (await b.inner_text()).strip()
-                    if "立即预订" in text or "立即购买" in text or "立即购票" in text:
+                    if is_purchase_button_text(text) and not await element_is_disabled(b):
                         await human_like_delay(page, 0.1)
                         await b.click()
                         logger.info(f"已点击底部按钮: {text}")
@@ -474,6 +580,7 @@ async def click_bottom_button(page: Page) -> bool:
         except Exception as e:
             logger.debug(f"点击底部按钮出错: {e}")
         await asyncio.sleep(random_delay(0.1, 0.03))
+    await log_visible_actions(page, "点击开售按钮失败")
     return False
 
 
@@ -681,8 +788,69 @@ async def select_payment_method(page: Page, payment_method: str) -> bool:
     return False
 
 
-async def order_submission_succeeded(page: Page, previous_url: str) -> bool:
+class OrderFlowObserver:
+    """仅观察页面本来就发出的订单接口响应，不主动请求或修改订单。"""
+
+    def __init__(self, page: Page):
+        self.page = page
+        self.events: list[dict] = []
+
+    def install(self):
+        self.page.on("response", self._on_response)
+
+    def mark(self) -> int:
+        return len(self.events)
+
+    def _on_response(self, response):
+        url = response.url
+        if "/api/ticket/order/" not in url:
+            return
+        asyncio.create_task(self._record_response(response))
+
+    async def _record_response(self, response):
+        try:
+            payload = await response.json()
+        except Exception:
+            return
+        if not isinstance(payload, dict) or "code" not in payload:
+            return
+
+        url = response.url
+        phase = "create" if "/order/create" in url else "prepare" if "/order/prepare" in url else "other"
+        event = {
+            "phase": phase,
+            "code": payload.get("code"),
+            "message": str(payload.get("message") or payload.get("msg") or ""),
+        }
+        self.events.append(event)
+        if phase == "create":
+            if event["code"] == 0:
+                logger.info("服务端已确认创建订单")
+            else:
+                logger.warning(
+                    f"服务端创建订单未成功: code={event['code']} {event['message']}"
+                )
+
+    def create_succeeded_since(self, marker: int) -> bool:
+        return any(
+            event["phase"] == "create" and event["code"] == 0
+            for event in self.events[marker:]
+        )
+
+    def create_failed_since(self, marker: int) -> Optional[dict]:
+        for event in reversed(self.events[marker:]):
+            if event["phase"] == "create" and event["code"] != 0:
+                return event
+        return None
+
+
+async def order_submission_succeeded(
+    page: Page, previous_url: str, observer: Optional[OrderFlowObserver] = None,
+    marker: int = 0,
+) -> bool:
     """只根据明确的支付页/成功信号判断提交成功。"""
+    if observer and observer.create_succeeded_since(marker):
+        return True
     url = page.url.lower()
     success_url_tokens = ("cashier", "payment", "pay.html", "/pay/", "order/success")
     if url != previous_url.lower() and any(token in url for token in success_url_tokens):
@@ -693,7 +861,12 @@ async def order_submission_succeeded(page: Page, previous_url: str) -> bool:
     return False
 
 
-async def submit_order_confirmation(page: Page, payment_method: str = "wechat", max_retry: int = 10) -> bool:
+async def submit_order_confirmation(
+    page: Page,
+    payment_method: str = "wechat",
+    max_retry: int = 10,
+    observer: Optional[OrderFlowObserver] = None,
+) -> bool:
     """在确认订单页面提交订单；仅在出现明确成功信号后返回 True。"""
     logger.info("进入确认订单页面，尝试提交订单...")
     await select_payment_method(page, payment_method)
@@ -714,7 +887,7 @@ async def submit_order_confirmation(page: Page, payment_method: str = "wechat", 
             except Exception as e:
                 logger.debug(f"点击重试失败: {e}")
 
-        if await order_submission_succeeded(page, page.url):
+        if await order_submission_succeeded(page, page.url, observer):
             return True
 
         submit_btn = await wait_for_element_by_text(
@@ -730,6 +903,7 @@ async def submit_order_confirmation(page: Page, payment_method: str = "wechat", 
             continue
 
         previous_url = page.url
+        marker = observer.mark() if observer else 0
         try:
             await human_like_delay(page, 0.1)
             await submit_btn.click()
@@ -741,9 +915,17 @@ async def submit_order_confirmation(page: Page, payment_method: str = "wechat", 
 
         deadline = time.time() + 2.5
         while time.time() < deadline:
-            if await order_submission_succeeded(page, previous_url):
+            if await order_submission_succeeded(page, previous_url, observer, marker):
                 logger.info("已确认进入支付流程")
                 return True
+            if observer:
+                failed_event = observer.create_failed_since(marker)
+                if failed_event:
+                    logger.warning(
+                        "服务端拒绝本次提交，等待页面显示重试入口: "
+                        f"{failed_event['message'] or failed_event['code']}"
+                    )
+                    break
             retry_btn = await wait_for_element_by_text(
                 page, "再试一次", selector=action_selector, timeout=0.15, exact=True
             )
@@ -851,6 +1033,8 @@ async def run_purchase_flow(page: Page, config: dict):
     payment_method = config.get("payment_method", "wechat")
     test_mode = config.get("test_mode", True)
     action_delay = config.get("action_delay", 0.5)
+    order_observer = OrderFlowObserver(page)
+    order_observer.install()
 
     # 1. 打开页面
     logger.info("打开购票页面...")
@@ -893,9 +1077,26 @@ async def run_purchase_flow(page: Page, config: dict):
     await take_screenshot(page, "presale_probe")
 
     # 2. 等待开售
-    sale_time = datetime.strptime(config["sale_time"], "%Y-%m-%d %H:%M:%S")
+    sale_time = parse_sale_time(
+        config["sale_time"], config.get("sale_timezone", DEFAULT_SALE_TIMEZONE)
+    )
     sale_time_offset = config.get("sale_time_offset", 0.0)
-    await wait_for_sale_start(sale_time, config.get("countdown_seconds_before", 60), sale_time_offset)
+    if not test_mode and sale_time_is_stale(sale_time, get_synced_timestamp()):
+        logger.error(
+            "开售时间已超过 60 秒；为避免使用旧配置误操作，已停止自动下单。"
+            "请检查 sale_time 或暂时启用 test_mode。"
+        )
+        return False
+    logger.info(
+        f"开售时间按 {config.get('sale_timezone', DEFAULT_SALE_TIMEZONE)} 解释: "
+        f"{sale_time.isoformat()}"
+    )
+    await wait_for_sale_start(
+        sale_time,
+        config.get("countdown_seconds_before", 60),
+        sale_time_offset,
+        resync_callback=lambda: sync_server_time(page),
+    )
 
     # 开售瞬间：强制刷新页面
     logger.info("开售时间到，强制刷新页面...")
@@ -921,6 +1122,7 @@ async def run_purchase_flow(page: Page, config: dict):
     if not await wait_for_modal(page, timeout=5):
         logger.error("购票弹窗未出现")
         await take_screenshot(page, "modal_not_appear")
+        await log_visible_actions(page, "购票弹窗未出现")
         prompt_continue("购票弹窗未出现，请手动点击底部按钮")
         if not await wait_for_modal(page, timeout=5):
             return False
@@ -928,6 +1130,7 @@ async def run_purchase_flow(page: Page, config: dict):
     # 5. 选择日期
     if not await select_date(page, target_date, timeout=5):
         logger.warning("选择日期失败")
+        await log_visible_actions(page, "未匹配到目标日期")
         prompt_continue("未找到目标日期，请手动选择后")
 
     await human_like_delay(page, action_delay)
@@ -935,6 +1138,7 @@ async def run_purchase_flow(page: Page, config: dict):
     # 6. 选择票档
     if not await select_ticket(page, target_ticket, timeout=5):
         logger.warning("选择票档失败")
+        await log_visible_actions(page, "未匹配到目标票档")
         prompt_continue("未找到目标票档，请手动选择后")
 
     await human_like_delay(page, action_delay)
@@ -963,7 +1167,7 @@ async def run_purchase_flow(page: Page, config: dict):
     if viewer_name and not await select_viewer(page, viewer_name, timeout=5):
         prompt_continue(f"未能自动选择观演人 {viewer_name}，请手动选择")
     success = await submit_order_confirmation(
-        page, payment_method, max_retry=config.get("max_retry", 30)
+        page, payment_method, max_retry=config.get("max_retry", 30), observer=order_observer
     )
 
     if success:
@@ -998,15 +1202,24 @@ async def main():
         if channel:
             launch_kwargs["channel"] = channel
 
-        browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(
-            viewport={"width": 400, "height": 811},
-            user_agent=MOBILE_USER_AGENT,
-            device_scale_factor=2,
-            is_mobile=True,
-            has_touch=True,
-            locale="zh-CN",
-        )
+        browser = await launch_ticket_browser(p, launch_kwargs)
+        if browser is None:
+            prompt_continue("浏览器无法启动，已停止运行；请安装或修复 Chrome/Edge 后重试")
+            return
+        try:
+            context = await browser.new_context(
+                viewport={"width": 400, "height": 811},
+                user_agent=MOBILE_USER_AGENT,
+                device_scale_factor=2,
+                is_mobile=True,
+                has_touch=True,
+                locale="zh-CN",
+            )
+        except Exception as error:
+            logger.error(f"浏览器上下文创建失败: {error}")
+            await browser.close()
+            prompt_continue("浏览器初始化失败，已停止运行；请关闭占用的浏览器后重试")
+            return
 
         # 加载 Cookie，并在抢票前验证是否仍然有效。
         cookies_valid = False
@@ -1026,15 +1239,24 @@ async def main():
             if not await ensure_login(headless=False):
                 logger.error("登录失败")
                 return
-            browser = await p.chromium.launch(**launch_kwargs)
-            context = await browser.new_context(
-                viewport={"width": 400, "height": 811},
-                user_agent=MOBILE_USER_AGENT,
-                device_scale_factor=2,
-                is_mobile=True,
-                has_touch=True,
-                locale="zh-CN",
-            )
+            browser = await launch_ticket_browser(p, launch_kwargs)
+            if browser is None:
+                prompt_continue("重新登录后浏览器无法启动，已停止运行；请修复浏览器后重试")
+                return
+            try:
+                context = await browser.new_context(
+                    viewport={"width": 400, "height": 811},
+                    user_agent=MOBILE_USER_AGENT,
+                    device_scale_factor=2,
+                    is_mobile=True,
+                    has_touch=True,
+                    locale="zh-CN",
+                )
+            except Exception as error:
+                logger.error(f"重新登录后浏览器初始化失败: {error}")
+                await browser.close()
+                prompt_continue("浏览器初始化失败，已停止运行；请关闭占用的浏览器后重试")
+                return
             if not await load_cookies(context):
                 logger.error("重新登录后仍无法加载 Cookie")
                 await browser.close()
@@ -1047,12 +1269,21 @@ async def main():
             if success:
                 logger.info("抢票流程执行完毕")
                 await take_screenshot(page, "success_final")
+                if config.get("keep_browser_open", True):
+                    if config.get("test_mode", True):
+                        prompt_continue("测试流程已暂停，检查页面选项无误后")
+                    else:
+                        prompt_continue("订单已进入支付/确认阶段，请手动完成支付或确认状态后")
             else:
                 logger.error("抢票流程未能完成")
                 await take_screenshot(page, "failed_final")
+                if config.get("keep_browser_open_on_failure", True):
+                    prompt_continue("自动流程失败，浏览器会保持打开；请检查页面后")
         except Exception as e:
             logger.exception(f"运行异常: {e}")
             await take_screenshot(page, "exception_final")
+            if config.get("keep_browser_open_on_failure", True):
+                prompt_continue("程序发生异常，浏览器会保持打开；请检查页面后")
         finally:
             await save_cookies(context)
             await browser.close()
