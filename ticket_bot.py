@@ -56,6 +56,24 @@ def setup_logger():
     logger.add(BASE_DIR / "ticket_bot.log", level="DEBUG", encoding="utf-8", rotation="10 MB")
 
 
+def browser_launch_error_message(error: Exception) -> str:
+    """Return an actionable error for a missing/broken Playwright browser runtime."""
+    return (
+        "浏览器启动失败。请确认 Chrome 或 Edge 可以正常打开；若只安装了源码依赖，"
+        "请在项目目录运行 `python -m playwright install chromium` 后重试。"
+        f" 原始错误: {error}"
+    )
+
+
+async def launch_ticket_browser(playwright, launch_kwargs: dict):
+    """Launch a browser without letting a missing runtime close the program silently."""
+    try:
+        return await playwright.chromium.launch(**launch_kwargs)
+    except Exception as error:
+        logger.error(browser_launch_error_message(error))
+        return None
+
+
 def resolve_sale_timezone(timezone_name: str):
     """Windows 未安装 tzdata 时仍可靠地支持会员购使用的中国标准时间。"""
     if timezone_name in ("Asia/Shanghai", "Asia/Chongqing", "Asia/Harbin", "PRC"):
@@ -348,6 +366,11 @@ def parse_sale_time(value: str, timezone_name: str) -> datetime:
     """把配置中的开售时间明确解释为指定时区，避免电脑系统时区造成误抢。"""
     local_dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
     return local_dt.replace(tzinfo=resolve_sale_timezone(timezone_name))
+
+
+def sale_time_is_stale(sale_time: datetime, server_timestamp: float, grace_seconds: float = 60) -> bool:
+    """Guard against a forgotten historical sale_time in non-test mode."""
+    return sale_time.timestamp() < server_timestamp - grace_seconds
 
 
 async def wait_for_element_by_text(
@@ -1058,7 +1081,7 @@ async def run_purchase_flow(page: Page, config: dict):
         config["sale_time"], config.get("sale_timezone", DEFAULT_SALE_TIMEZONE)
     )
     sale_time_offset = config.get("sale_time_offset", 0.0)
-    if not test_mode and sale_time.timestamp() < get_synced_timestamp() - 60:
+    if not test_mode and sale_time_is_stale(sale_time, get_synced_timestamp()):
         logger.error(
             "开售时间已超过 60 秒；为避免使用旧配置误操作，已停止自动下单。"
             "请检查 sale_time 或暂时启用 test_mode。"
@@ -1179,15 +1202,24 @@ async def main():
         if channel:
             launch_kwargs["channel"] = channel
 
-        browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(
-            viewport={"width": 400, "height": 811},
-            user_agent=MOBILE_USER_AGENT,
-            device_scale_factor=2,
-            is_mobile=True,
-            has_touch=True,
-            locale="zh-CN",
-        )
+        browser = await launch_ticket_browser(p, launch_kwargs)
+        if browser is None:
+            prompt_continue("浏览器无法启动，已停止运行；请安装或修复 Chrome/Edge 后重试")
+            return
+        try:
+            context = await browser.new_context(
+                viewport={"width": 400, "height": 811},
+                user_agent=MOBILE_USER_AGENT,
+                device_scale_factor=2,
+                is_mobile=True,
+                has_touch=True,
+                locale="zh-CN",
+            )
+        except Exception as error:
+            logger.error(f"浏览器上下文创建失败: {error}")
+            await browser.close()
+            prompt_continue("浏览器初始化失败，已停止运行；请关闭占用的浏览器后重试")
+            return
 
         # 加载 Cookie，并在抢票前验证是否仍然有效。
         cookies_valid = False
@@ -1207,15 +1239,24 @@ async def main():
             if not await ensure_login(headless=False):
                 logger.error("登录失败")
                 return
-            browser = await p.chromium.launch(**launch_kwargs)
-            context = await browser.new_context(
-                viewport={"width": 400, "height": 811},
-                user_agent=MOBILE_USER_AGENT,
-                device_scale_factor=2,
-                is_mobile=True,
-                has_touch=True,
-                locale="zh-CN",
-            )
+            browser = await launch_ticket_browser(p, launch_kwargs)
+            if browser is None:
+                prompt_continue("重新登录后浏览器无法启动，已停止运行；请修复浏览器后重试")
+                return
+            try:
+                context = await browser.new_context(
+                    viewport={"width": 400, "height": 811},
+                    user_agent=MOBILE_USER_AGENT,
+                    device_scale_factor=2,
+                    is_mobile=True,
+                    has_touch=True,
+                    locale="zh-CN",
+                )
+            except Exception as error:
+                logger.error(f"重新登录后浏览器初始化失败: {error}")
+                await browser.close()
+                prompt_continue("浏览器初始化失败，已停止运行；请关闭占用的浏览器后重试")
+                return
             if not await load_cookies(context):
                 logger.error("重新登录后仍无法加载 Cookie")
                 await browser.close()
